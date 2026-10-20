@@ -30,6 +30,7 @@ class InterfaceTests(unittest.TestCase):
         self.assertEqual(result['duplicates'], 1)
         self.assertEqual(json.loads(result['review'])[0]['source_file'], 'lecture.pdf')
         self.assertNotIn('test-key', result['review'].decode())
+        self.assertEqual(result['chunk_reports'][0]['generated'], 1)
         with zipfile.ZipFile(BytesIO(result['apkg'])) as archive:
             self.assertIn('collection.anki2', archive.namelist())
         client.assert_called_once_with(api_key='test-key', timeout=120.0, max_retries=3)
@@ -45,9 +46,31 @@ class InterfaceTests(unittest.TestCase):
         from streamlit.testing.v1 import AppTest
         ui = AppTest.from_file('streamlit_app.py').run()
         self.assertFalse(ui.exception)
+        self.assertEqual(ui.number_input[1].value, 6)
         ui.button[0].click().run()
         self.assertFalse(ui.exception)
         self.assertIn('Upload at least one PDF', ui.error[0].value)
+
+    def test_minimum_above_maximum_is_rejected_before_generation(self):
+        from streamlit.testing.v1 import AppTest
+        from streamlit_app import build_downloads
+        with patch('streamlit_app.OpenAI') as client:
+            with self.assertRaises(ValueError):
+                build_downloads([('lecture.pdf', self.pdf_bytes())], 'test-key', 'Medicine',
+                                'test-model', 4, minimum_cards_per_chunk=6)
+            client.assert_not_called()
+
+    def test_chunk_shortfalls_report_actual_exported_count(self):
+        from app import Flashcard
+        from streamlit_app import build_downloads
+        card = Flashcard(question='What is the primary pacemaker of the heart?',
+                         answer='Sinoatrial node', topic='Cardiology', source_page=1,
+                         evidence='The sinoatrial node is the primary pacemaker of the heart.')
+        with patch('streamlit_app.OpenAI'), patch('streamlit_app.generate_cards', return_value=[card, card]):
+            result = build_downloads([('lecture.pdf', self.pdf_bytes())], 'test-key', 'Medicine',
+                                     'test-model', 20, minimum_cards_per_chunk=6)
+        self.assertEqual(result['chunk_reports'][0]['generated'], 1)
+        self.assertEqual(result['chunk_reports'][0]['minimum'], 6)
 
     def test_stale_rows_without_card_type_are_invalidated(self):
         from streamlit.testing.v1 import AppTest

@@ -12,7 +12,7 @@ import streamlit as st
 
 from app import ModelOutputError, extract_pages, export_deck, generate_cards, make_chunks, normalize, validate_grounding
 
-RESULT_SCHEMA_VERSION = 3
+RESULT_SCHEMA_VERSION = 4
 
 
 def current_deck_result(result: object) -> bool:
@@ -38,6 +38,7 @@ def build_downloads(
     model: str,
     cards_per_chunk: int,
     progress: Callable[[float, str], None] | None = None,
+    minimum_cards_per_chunk: int = 6,
 ) -> dict:
     """Use isolated temporary files; return download bytes after cleanup.
 
@@ -50,6 +51,8 @@ def build_downloads(
         raise ValueError('An API key, deck name, and model are required.')
     if not 1 <= cards_per_chunk <= 40:
         raise ValueError('Cards per chunk must be between 1 and 40.')
+    if not 0 <= minimum_cards_per_chunk <= cards_per_chunk:
+        raise ValueError('Minimum cards must be between 0 and the maximum cards per chunk.')
     with tempfile.TemporaryDirectory(prefix='medical_anki_') as directory:
         root = Path(directory)
         jobs = []
@@ -73,13 +76,16 @@ def build_downloads(
             jobs.extend((label, chunk) for chunk in make_chunks(pages, 12000))
 
         accepted = []
+        chunk_reports = []
         seen = set()
         rejected = duplicates = 0
         with OpenAI(api_key=api_key.strip(), timeout=120.0, max_retries=3) as client:
             for index, (label, chunk) in enumerate(jobs):
                 if progress:
                     progress(index / len(jobs), f'Generating chunk {index + 1} of {len(jobs)}')
-                for card in generate_cards(client, chunk, model.strip(), cards_per_chunk):
+                before = len(accepted)
+                for card in generate_cards(client, chunk, model.strip(), cards_per_chunk,
+                                           minimum=minimum_cards_per_chunk, excluded_questions=seen):
                     try:
                         validate_grounding(card, chunk)
                     except ValueError:
@@ -91,6 +97,10 @@ def build_downloads(
                         continue
                     seen.add(key)
                     accepted.append((label, card))
+                chunk_reports.append({'file': label, 'chunk': index + 1,
+                                      'generated': len(accepted) - before,
+                                      'minimum': minimum_cards_per_chunk,
+                                      'maximum': cards_per_chunk})
         if not accepted:
             raise ValueError('No cards passed the source and UK Year 4 level checks. '
                              'Try material with more clinical detail or clearer text.')
@@ -103,6 +113,7 @@ def build_downloads(
             'apkg': output.read_bytes(),
             'review': json.dumps(rows, ensure_ascii=False, indent=2).encode('utf-8'),
             'rows': rows,
+            'chunk_reports': chunk_reports,
             'count': len(rows),
             'rejected': rejected,
             'duplicates': duplicates,
@@ -133,6 +144,11 @@ def main() -> None:
             model = st.text_input('OpenAI model', value=os.getenv('OPENAI_MODEL', 'gpt-4.1-mini'))
             cards_per_chunk = st.number_input('Maximum cards per text chunk',
                                               min_value=1, max_value=40, value=20)
+            minimum_cards_per_chunk = st.number_input('Minimum cards per text chunk',
+                min_value=0, max_value=40, value=6,
+                help='Target after review and duplicate filtering. Up to two extra coverage passes '
+                     'try to reach it. Unsupported material is never added just to meet the count. '
+                     'Set 0 to disable the minimum target.')
         st.caption('Generation and educational review send extracted PDF text to OpenAI and incur '
                    'API usage charges. Small generation/review batches and automatic '
                    'retries may require several requests per text chunk. '
@@ -148,6 +164,8 @@ def main() -> None:
             st.error('Enter your OpenAI API key or set OPENAI_API_KEY locally.')
         elif not deck_name.strip() or not model.strip():
             st.error('Enter a deck name and model.')
+        elif minimum_cards_per_chunk > cards_per_chunk:
+            st.error('Minimum cards per chunk cannot exceed the maximum.')
         else:
             bar = st.progress(0.0, text='Reading PDFs…')
             try:
@@ -156,6 +174,7 @@ def main() -> None:
                         [(upload.name, upload.getvalue()) for upload in uploads],
                         api_key, deck_name, model, int(cards_per_chunk),
                         progress=lambda value, message: bar.progress(value, text=message),
+                        minimum_cards_per_chunk=int(minimum_cards_per_chunk),
                     )
                 st.session_state['deck_result'] = result
             except AuthenticationError:
@@ -183,6 +202,15 @@ def main() -> None:
     if result:
         st.success(f"{result['count']} flashcards ready — {result['deck_name']}")
         st.text('Generated from: ' + ', '.join(result['files']))
+        chunk_reports = result.get('chunk_reports', [])
+        shortfalls = [row for row in chunk_reports if row['generated'] < row['minimum']]
+        if shortfalls:
+            st.warning(f"{len(shortfalls)} text chunk(s) did not reach the requested minimum after "
+                       'coverage attempts and quality checks. Review the counts below; fewer cards '
+                       'may reflect limited source material or filtering. Card count alone does not '
+                       'guarantee complete topic coverage.')
+        with st.expander('Cards per text chunk'):
+            st.dataframe(chunk_reports, hide_index=True)
         if result['skipped_pages']:
             st.warning(f"{result['skipped_pages']} pages had no extractable text and were skipped.")
         st.caption(f"Filtered: {result['rejected']} unsupported excerpts, "

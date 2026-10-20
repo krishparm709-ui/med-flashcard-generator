@@ -216,22 +216,60 @@ def make_chunks(pages: dict[int, str], limit: int) -> Iterator[Chunk]:
         yield chunk
 
 
-def generate_cards(client: OpenAI, chunk: Chunk, model: str, maximum: int) -> list[Flashcard]:
+def generate_cards(client: OpenAI, chunk: Chunk, model: str, maximum: int, *,
+                   minimum: int = 0, excluded_questions: set[str] | None = None) -> list[Flashcard]:
     """Reserve roughly 40% of capacity for overviews/patterns, 60% for detail.
 
     Separate passes give broad recall dedicated space; source limitations or
     quality review may reduce the final count and alter the actual proportions.
     """
-    if maximum < 1:
-        raise ValueError('At least one card must be requested.')
+    if maximum < 1 or not 0 <= minimum <= maximum:
+        raise ValueError('Minimum cards must be between 0 and the maximum; maximum must be positive.')
+    excluded = set(excluded_questions or ())
     broad_limit = max(1, (maximum * 2 + 4) // 5)
-    broad = generate_card_style(client, chunk, model, broad_limit, 'broad')
+    broad = generate_card_style(client, chunk, model, broad_limit, 'broad',
+                                minimum=(minimum * 2 + 4) // 5,
+                                excluded_questions=excluded)
     detail_limit = maximum - broad_limit
-    detail = generate_card_style(client, chunk, model, detail_limit, 'detail') if detail_limit else []
-    return review_cards(client, chunk, broad + detail, model)
+    detail = generate_card_style(client, chunk, model, detail_limit, 'detail',
+                                 minimum=minimum - (minimum * 2 + 4) // 5,
+                                 excluded_questions=excluded) if detail_limit else []
+    attempted = {card.question for card in broad + detail} | excluded
+    accepted: list[Flashcard] = []
+    seen = {normalize(question).casefold() for question in excluded}
+
+    def accept(cards: list[Flashcard]) -> None:
+        for card in cards:
+            try:
+                validate_grounding(card, chunk)
+            except ValueError:
+                continue
+            key = normalize(card.question).casefold()
+            if key not in seen and len(accepted) < maximum:
+                accepted.append(card)
+                seen.add(key)
+
+    accept(review_cards(client, chunk, broad + detail, model))
+    for _ in range(2):
+        if len(accepted) >= minimum:
+            break
+        deficit = minimum - len(accepted)
+        try:
+            extra = generate_card_style(client, chunk, model, deficit, 'mixed',
+                                        minimum=deficit, excluded_questions=attempted)
+            attempted.update(card.question for card in extra)
+            accept(review_cards(client, chunk, extra, model))
+        except ModelOutputError:
+            LOG.warning('Additional coverage could not be validated; retaining only approved cards.')
+            break
+    if len(accepted) < minimum:
+        LOG.warning('Chunk produced %d approved unique cards; requested minimum was %d.',
+                    len(accepted), minimum)
+    return accepted
 
 
-def generate_card_style(client: OpenAI, chunk: Chunk, model: str, maximum: int, style: str) -> list[Flashcard]:
+def generate_card_style(client: OpenAI, chunk: Chunk, model: str, maximum: int, style: str, *,
+                        minimum: int = 0, excluded_questions: set[str] | None = None) -> list[Flashcard]:
     style_instructions = (
         'Generate only card_type overview or pattern. Cover the main topics in this '
         'chunk using bounded clinical overviews and OSCE recognition patterns; '
@@ -242,19 +280,32 @@ def generate_card_style(client: OpenAI, chunk: Chunk, model: str, maximum: int, 
         'diagnostic discriminators, mechanisms, complications, and clinical decisions. '
         'Balance core facts with relevant high-specificity details, not rare trivia.'
     )
+    if style == 'mixed':
+        style_instructions = (
+            'Find important uncovered topics, presentations, learning objectives and relationships '
+            'in this source. Generate additional overview, pattern or detail cards to fill those '
+            'coverage gaps. Do not rephrase existing questions or repeat their learning objectives. '
+            'Prefer missing core features over niche trivia. Never add filler or unsupported facts.'
+        )
     source = json.dumps([{'page': n, 'text': t} for n, t in chunk], ensure_ascii=False)
-    allowed = {'overview', 'pattern'} if style == 'broad' else {'detail'}
+    allowed = {'overview', 'pattern', 'detail'} if style == 'mixed' else (
+        {'overview', 'pattern'} if style == 'broad' else {'detail'})
+    existing = set(excluded_questions or ())
     accepted: list[Flashcard] = []
     remaining_recoveries = MAX_OUTPUT_RECOVERIES
 
     def generate_group(capacity: int, single_retry: bool = False) -> None:
         nonlocal remaining_recoveries
-        excluded = json.dumps([card.question for card in accepted], ensure_ascii=False)
+        excluded = json.dumps(sorted(existing | {card.question for card in accepted}), ensure_ascii=False)
+        minimum_for_batch = min(capacity, max(0, minimum - len(accepted)))
         try:
             batch = request_structured(
                 client, model, CardBatch,
                 INSTRUCTIONS + '\n' + style_instructions
-                + f'\nReturn at most {capacity} cards for this chunk.',
+                + f'\nReturn at most {capacity} cards for this chunk.'
+                + f' Aim for at least {minimum_for_batch} additional useful cards in this request '
+                'where supported by the source. Cover distinct learning objectives rather than '
+                'padding the count. Quality and source support take precedence over the target.',
                 f'Generate recall cards from this source JSON:\n{source}\n'
                 f'Do not repeat these previously generated questions: {excluded}',
             )
@@ -272,7 +323,8 @@ def generate_card_style(client: OpenAI, chunk: Chunk, model: str, maximum: int, 
             return
         if len(batch.cards) > capacity:
             raise ValueError('Model exceeded the requested card limit.')
-        seen = {normalize(card.question).casefold() for card in accepted}
+        seen = {normalize(question).casefold() for question in existing}
+        seen.update(normalize(card.question).casefold() for card in accepted)
         for card in batch.cards:
             key = normalize(card.question).casefold()
             if card.card_type in allowed and key not in seen:
@@ -413,11 +465,14 @@ def main() -> int:
     parser.add_argument('--model', default=os.getenv('OPENAI_MODEL', 'gpt-4.1-mini'))
     parser.add_argument('--chunk-chars', type=int, default=12000)
     parser.add_argument('--cards-per-chunk', type=int, default=20)
+    parser.add_argument('--min-cards-per-chunk', type=int, default=6)
     args = parser.parse_args()
     if not os.getenv('OPENAI_API_KEY'):
         parser.error('Set the OPENAI_API_KEY environment variable first.')
     if args.chunk_chars < 100 or not 1 <= args.cards_per_chunk <= 40:
         parser.error('--chunk-chars must be >= 100; --cards-per-chunk must be 1..40.')
+    if not 0 <= args.min_cards_per_chunk <= args.cards_per_chunk:
+        parser.error('--min-cards-per-chunk must be between 0 and --cards-per-chunk.')
     if args.output.suffix.lower() != '.apkg' or not args.deck_name.strip():
         parser.error('Output must end in .apkg and the deck name must not be blank.')
     for path in args.pdfs:
@@ -433,7 +488,9 @@ def main() -> int:
             pages = extract_pages(path)
             for number, chunk in enumerate(make_chunks(pages, args.chunk_chars), 1):
                 LOG.info('%s: generating chunk %d', path.name, number)
-                for card in generate_cards(client, chunk, args.model, args.cards_per_chunk):
+                before = len(accepted)
+                for card in generate_cards(client, chunk, args.model, args.cards_per_chunk,
+                                           minimum=args.min_cards_per_chunk, excluded_questions=seen_questions):
                     try:
                         validate_grounding(card, chunk)
                     except ValueError as error:
@@ -445,6 +502,9 @@ def main() -> int:
                         continue
                     seen_questions.add(question_key)
                     accepted.append((path.name, card))
+                if len(accepted) - before < args.min_cards_per_chunk:
+                    LOG.warning('%s chunk %d: exported %d/%d minimum cards; source/quality limits may apply.',
+                                path.name, number, len(accepted) - before, args.min_cards_per_chunk)
     if not accepted:
         raise ValueError('No valid cards were generated; no deck was written.')
     # Persist reviewable source quotes before exporting the deck.

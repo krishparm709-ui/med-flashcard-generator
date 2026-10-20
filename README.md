@@ -52,6 +52,17 @@ it must not invent clinical context or imply that a partial list is exhaustive.
 This is an educational target, not certification against a university curriculum.
 Regenerate existing decks to apply the balanced approach.
 
+Generation settings include a **minimum target of 6** and **maximum of 20** cards
+per text chunk by default. The minimum cannot exceed the maximum; set it to zero
+to disable additional coverage attempts. Counts refer to approved, grounded,
+unique cards, including duplicate filtering across the deck. If needed, up to
+two additional passes look for uncovered learning objectives and review the new
+cards. This increases API usage. Source/quality limitations can leave a shortfall;
+the interface warns and shows the actual count for each chunk. A count target
+encourages coverage but cannot guarantee every key topic has been captured.
+
+The command-line equivalent is `--min-cards-per-chunk 6 --cards-per-chunk 20`.
+
 The original command-line interface remains available:
 
 ```powershell

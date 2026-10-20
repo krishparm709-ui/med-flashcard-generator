@@ -6,7 +6,7 @@ import unittest
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 
 class PipelineTests(unittest.TestCase):
@@ -138,6 +138,28 @@ class PipelineTests(unittest.TestCase):
             client = SimpleNamespace(responses=SimpleNamespace(parse=lambda **kwargs: response))
             with self.assertRaises(RuntimeError):
                 app.generate_cards(client, [(1, 'Source')], 'test-model', 10)
+
+    def test_minimum_requests_additional_approved_unique_cards(self):
+        import app
+        source = [(1, 'Condition X presents with sign A. Condition X presents with sign B.')]
+        first = app.Flashcard(question='Which condition presents with sign A?', answer='Condition X',
+            topic='Condition X', source_page=1, evidence='Condition X presents with sign A.')
+        second = first.model_copy(update={'question': 'Which condition presents with sign B?',
+                                         'evidence': 'Condition X presents with sign B.'})
+        with patch('app.generate_card_style', side_effect=[[first], [], [first, second]]) as generate, \
+             patch('app.review_cards', side_effect=lambda client, chunk, cards, model: cards):
+            result = app.generate_cards(Mock(), source, 'test-model', 4, minimum=2)
+        self.assertEqual(result, [first, second])
+        self.assertEqual(generate.call_count, 3)
+        self.assertIn(first.question, generate.call_args.kwargs['excluded_questions'])
+
+    def test_minimum_cannot_exceed_maximum_and_topups_are_bounded(self):
+        import app
+        with self.assertRaises(ValueError):
+            app.generate_cards(Mock(), [(1, 'Source')], 'test-model', 4, minimum=6)
+        with patch('app.generate_card_style', return_value=[]) as generate:
+            self.assertEqual(app.generate_cards(Mock(), [(1, 'Source')], 'test-model', 10, minimum=6), [])
+        self.assertEqual(generate.call_count, 4)  # Two initial styles and two coverage attempts.
 
     def test_truncated_json_retries_in_smaller_batches(self):
         import app
