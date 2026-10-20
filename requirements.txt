@@ -1,0 +1,5 @@
+PyMuPDF>=1.24,<2
+openai>=2.0,<3
+pydantic>=2.8,<3
+genanki>=0.13.1,<0.14
+streamlit>=1.40,<2
